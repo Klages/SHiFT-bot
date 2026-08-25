@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  shift-bot:
+    build: .
+    container_name: shift-bot-container
+    ports:
+      - "5500:5000"
+    volumes:
+      - datastore:/app/data
+    environment:
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+
+volumes:
+  datastore:
+  
+#comment for pulling latest image not from cache
