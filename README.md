@@ -2,6 +2,9 @@
 
 A Python bot and web dashboard that tracks **Borderlands 4** SHiFT codes. It watches `/r/BorderlandsShiftCodes`, alerts you on Discord, and gives you a local dashboard to keep track of which codes you have activated.
 
+<img width="1816" height="1099" alt="image" src="https://github.com/user-attachments/assets/a90d05d8-d4df-4b81-ad74-64b50f8a6baf" />
+
+
 ## Features
 
 - **Reddit scraping that doesn't get blocked**: uses the subreddit's RSS feed with an honest User-Agent, a slow polling interval and automatic back-off on `429`/`403`. (Reddit blocks the `.json` endpoint and rate-limits browser-like User-Agents, so neither is used.)
