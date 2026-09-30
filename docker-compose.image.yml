@@ -1,0 +1,16 @@
+# Runs the prebuilt image from GHCR instead of building it (for a NAS or any always-on Docker host).
+services:
+  shift-bot:
+    image: ghcr.io/klages/shift-bot:latest
+    container_name: shift-bot
+    restart: unless-stopped
+    ports:
+      # Reachable from your LAN at http://<host-ip>:5500 - there is no login, so don't port-forward it.
+      - "5500:5000"
+    volumes:
+      # Folder on the host that keeps your state - create it first. Adjust the path to your setup.
+      - /volume1/docker/shift-bot/data:/app/data
+    environment:
+      - TZ=UTC   # set your own time zone, e.g. Europe/London
+      - DISCORD_WEBHOOK_URL=
+      - CHECK_INTERVAL_MINUTES=120

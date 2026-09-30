@@ -1,17 +1,15 @@
-version: '3.8'
-
 services:
   shift-bot:
     build: .
     container_name: shift-bot-container
+    restart: unless-stopped
     ports:
-      - "5500:5000"
+      # Local only. Change to "5500:5000" to expose it to your network (there is no auth).
+      - "127.0.0.1:5500:5000"
     volumes:
-      - datastore:/app/data
+      # Bind mount: state is stored in ./data next to this file and survives rebuilds.
+      # Use any host folder you like, e.g. "D:/shift-bot-data:/app/data".
+      - ./data:/app/data
     environment:
-      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
-
-volumes:
-  datastore:
-  
-#comment for pulling latest image not from cache
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
+      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-120}

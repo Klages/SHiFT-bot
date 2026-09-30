@@ -1,72 +1,59 @@
 # BL4 SHiFT Code Tracker
 
-A Python-based bot and web dashboard that automatically tracks and aggregates SHiFT codes for **Borderlands 4**. 
-
-It monitors community sources for new codes, filters out codes for older Borderlands games, alerts you on Discord, and provides a sleek web dashboard to keep track of which codes you have activated.
-
-<img width="2268" height="934" alt="image" src="https://github.com/user-attachments/assets/1e4448ea-c0e1-4fa7-a25d-f481c35715f6" />
+A Python bot and web dashboard that tracks **Borderlands 4** SHiFT codes. It watches `/r/BorderlandsShiftCodes`, alerts you on Discord, and gives you a local dashboard to keep track of which codes you have activated.
 
 ## Features
 
-- **Automated Scraping**: Regularly fetches new posts from the `/r/BorderlandsShiftCodes` subreddit and official Twitter accounts (`@GearboxOfficial`, `@Borderlands`).
-- **Smart Filtering**: Ignores SHiFT codes for older titles (BL2, BL3, Wonderlands, etc.) and only triggers on Borderlands 4 codes.
-- **Discord Integration**: Sends a beautiful embed message to a Discord channel via Webhook as soon as a new code is discovered.
-- **Web Dashboard**: A built-in web dashboard to view all active and expired codes, copy them to your clipboard, and mark them as activated.
-- **Steam Formats**: Quickly export the list of active codes in Steam-compatible BBCode or JSON formats to share on Steam discussions.
+- **Reddit scraping that doesn't get blocked**: uses the subreddit's RSS feed with an honest User-Agent, a slow polling interval and automatic back-off on `429`/`403`. (Reddit blocks the `.json` endpoint and rate-limits browser-like User-Agents, so neither is used.)
+- **Smart filtering**: understands posts like `BL4`, `MULTI` (all games) and lists such as `BL3: ... / BL4: ...`, and only keeps codes valid for Borderlands 4.
+- **Expiry detection**: parses `Expires 9/29`, `valid until Oct 5, 2026`, `expires 1st October`, ... Expired codes are greyed out automatically and left out of the Steam exports.
+- **Hide expired**: a "Show expired" toggle (remembered in your browser) keeps the list to codes that still work.
+- **One-click redeem**: the *Redeem* button copies the code and opens the SHiFT redeem page.
+- **Outage alerts**: if Reddit checks fail 3 times in a row you get one Discord message, and another when it recovers.
+- **Newest first**: codes are sorted by the time they were posted.
+- **Discord notifications** via webhook for codes posted in the last 3 days (so the initial import doesn't flood your channel).
+- **Web dashboard**: copy codes, mark them activated/expired, "Check now" button, logs, and Steam BBCode/JSON export.
 
-## Prerequisites
+## Run with Docker (recommended)
 
-- **Docker** and **Docker Compose** (Recommended)
-- *Alternatively*: Python 3.9+ if you wish to run it manually without Docker.
+```bash
+cp .env.example .env      # optionally set DISCORD_WEBHOOK_URL
+docker compose up -d
+```
 
-## Setup Instructions (Docker)
+Open <http://localhost:5500>. The port is only published on `127.0.0.1`; there is no authentication, so change the mapping in `docker-compose.yml` only if you know what you're doing.
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/yourusername/shift-code-bot.git
-   cd shift-code-bot
-   ```
+### Keeping your state
 
-2. **Configure your Environment Variables:**
-   Copy the example environment file and create your own `.env` file:
-   ```bash
-   cp .env.example .env
-   ```
-   Open the `.env` file and set your `DISCORD_WEBHOOK_URL`. If you don't want Discord notifications, you can leave it blank.
+All state is stored in a single file, `shift_codes_state.json`, in the folder mounted at `/app/data`. `docker-compose.yml` bind-mounts `./data` for that, so it survives rebuilds and `docker compose down`. To store it somewhere else, change the left side of the volume, e.g. `D:/shift-bot-data:/app/data`.
 
-3. **Build and Run the Container:**
-   Use Docker Compose to build and start the bot in the background:
-   ```bash
-   docker-compose up -d
-   ```
+## Run locally
 
-4. **Access the Web Dashboard:**
-   Open your browser and navigate to:
-   ```
-   http://localhost:5500
-   ```
+```bash
+pip install -r requirements.txt
+python shift-bot.py
+```
 
-## Setup Instructions (Manual / Local)
+Open <http://localhost:5000>. State is stored in `./data/`.
 
-1. Make sure you have Python 3 installed.
-2. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Set your Discord webhook as an environment variable (optional):
-   * On Windows (PowerShell): `$env:DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."`
-   * On Linux/Mac: `export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."`
-4. Run the script:
-   ```bash
-   python shift-bot.py
-   ```
-5. Access the web dashboard at `http://localhost:5000` (Note: Default Flask port is 5000 when run directly).
+## Configuration (environment variables)
 
-## How it works
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DISCORD_WEBHOOK_URL` | empty | Discord webhook; leave empty to disable notifications |
+| `CHECK_INTERVAL_MINUTES` | `120` | How often to check Reddit (minimum 5; lower values risk rate limits) |
+| `DATA_DIR` | `./data` (`/app/data` in Docker) | Folder for the state file |
+| `HOST` / `PORT` | `127.0.0.1` / `5000` | Address the dashboard listens on |
+| `REDDIT_USER_AGENT` | `windows:bl4-shift-tracker:2.0 (...)` | Sent to Reddit; a descriptive one avoids blocks |
 
-The bot uses a background worker thread that runs every 30 minutes to check the RSS feeds and JSON endpoints of Reddit and Twitter. 
-All discovered codes, along with metadata (when they were found, when they expire), are saved locally in `data/shift_codes_state.json`.
+## Upgrading from the old version
 
-## License
+Existing state is imported automatically (from `./shift_codes_state.json` if the new file doesn't exist yet). If your old Docker volume `datastore` held data, it was never used by the old code; there is nothing to migrate from it.
 
-This project is open-source. Feel free to modify and distribute it as needed!
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The suite covers the code/expiry parser (with real post shapes), Reddit error handling and back-off, storage, the API, Discord notifications and outage alerts.

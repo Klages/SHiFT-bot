@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BL4 SHiFT Codes</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .container { max-width: 1000px; }
+        .code-table { width: 100%; border-collapse: collapse; }
+        .code-table th, .code-table td { padding: 12px; border-bottom: 1px solid #30363d; text-align: left; }
+        .code-table th { background-color: #161b22; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em; }
+        .code-table tr:hover { background-color: #21262d; }
+        .code-table tbody tr.expired { color: #8b949e; text-decoration: line-through; }
+        .copy-button { background-color: #238636; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; min-width: 80px; }
+        .copy-button:hover { background-color: #2ea043; }
+        .redeem-button { background-color: #6e40c9; color: #fff; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+        .redeem-button:hover { background-color: #8957e5; }
+        .header-text { background-clip: text; -webkit-background-clip: text; color: transparent; background-image: linear-gradient(to right, #63a4ff, #8338ec); }
+        input[type="checkbox"] { appearance: none; width: 18px; height: 18px; border: 2px solid #58a6ff; border-radius: 4px; cursor: pointer; position: relative; }
+        input[type="checkbox"]:checked { background-color: #58a6ff; }
+        input[type="checkbox"]:checked::before { content: '✓'; color: #0d1117; font-size: 14px; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.7); display: none; align-items: center; justify-content: center; z-index: 1000; }
+        .modal-content { background-color: #161b22; padding: 24px; border-radius: 8px; max-width: 90%; max-height: 90%; overflow: auto; }
+        .modal-content pre { background-color: #0d1117; padding: 16px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
+        .log-entry { font-family: monospace; font-size: 12px; border-bottom: 1px solid #30363d; padding: 4px 0; }
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body class="p-6">
+    <div class="container mx-auto p-8 bg-[#161b22] rounded-lg shadow-lg">
+        <h1 class="text-3xl font-bold mb-6 text-center header-text">BL4 SHiFT Code Tracker</h1>
+        <p class="text-center mb-4 text-[#8b949e]">Automatically fetches codes from r/BorderlandsShiftCodes.</p>
+        <p id="last-checked" class="text-center text-sm text-[#8b949e] mb-2"></p>
+        <p id="last-error" class="text-center text-sm text-red-400 mb-6"></p>
+
+        <div class="flex flex-wrap justify-center gap-4 mb-8">
+            <button id="btn-json" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Show Steam JSON</button>
+            <button id="btn-bbcode" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded">Show Steam BBCode</button>
+            <button id="btn-logs" class="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">Show Logs</button>
+            <button id="btn-check" class="bg-teal-600 hover:bg-teal-700 text-white font-bold py-2 px-4 rounded">Check now</button>
+            <a href="https://shift.gearboxsoftware.com/rewards" target="_blank" rel="noopener" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded flex items-center">Activate Codes</a>
+        </div>
+
+        <div class="flex justify-between items-center mb-3 text-sm text-[#8b949e]">
+            <span id="counts"></span>
+            <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" id="show-expired"> Show expired</label>
+        </div>
+
+        <div class="overflow-x-auto">
+        <table class="code-table rounded-lg overflow-hidden">
+            <thead>
+                <tr>
+                    <th class="rounded-tl-lg">Code</th><th>Source</th><th>Posted</th><th>Expires</th><th class="text-center">Activated</th><th class="rounded-tr-lg text-center">Expired</th>
+                </tr>
+            </thead>
+            <tbody id="code-list">
+                <tr><td colspan="6" class="text-center py-4 text-[#8b949e]">Loading codes...</td></tr>
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+    <div id="steam-modal" class="modal-overlay"><div class="modal-content"><h2 class="text-2xl font-bold mb-4">Steam Formatted JSON</h2><pre id="steam-json-content" class="text-sm"></pre><div class="mt-4 flex justify-end gap-2"><button data-copy="steam-json-content" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Copy</button><button data-close class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">Close</button></div></div></div>
+    <div id="bbcode-modal" class="modal-overlay"><div class="modal-content"><h2 class="text-2xl font-bold mb-4">Steam Formatted BBCode</h2><pre id="bbcode-content" class="text-sm"></pre><div class="mt-4 flex justify-end gap-2"><button data-copy="bbcode-content" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Copy</button><button data-close class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">Close</button></div></div></div>
+    <div id="logs-modal" class="modal-overlay"><div class="modal-content" style="width: 800px;"><h2 class="text-2xl font-bold mb-4">System Logs</h2><div id="logs-content" class="bg-[#0d1117] p-4 rounded h-64 overflow-y-auto"></div><div class="mt-4 flex justify-end gap-2"><button id="btn-logs-refresh" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded">Refresh</button><button data-close class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">Close</button></div></div></div>
+
+    <script>
+        const $ = (id) => document.getElementById(id);
+
+        async function copyToClipboard(text, btn) {
+            let success = false;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                try { await navigator.clipboard.writeText(text); success = true; }
+                catch (err) { console.warn("Clipboard API failed"); }
+            }
+            if (!success) {
+                try {
+                    const ta = document.createElement("textarea"); ta.value = text;
+                    ta.style.position = "fixed"; ta.style.left = "-9999px";
+                    document.body.appendChild(ta); ta.focus(); ta.select();
+                    success = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                } catch (err) { console.error('Copy failed.'); }
+            }
+            if (success && btn) {
+                const original = btn.textContent;
+                btn.textContent = 'Copied!';
+                setTimeout(() => btn.textContent = original, 2000);
+            }
+        }
+
+        function closeModals() { document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none'); }
+
+        function el(tag, props = {}, ...children) {
+            const node = Object.assign(document.createElement(tag), props);
+            children.forEach(c => node.append(c));
+            return node;
+        }
+
+        async function setState(code, state, value) {
+            await fetch('/api/codes', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({code, state, value})
+            });
+            fetchCodes();
+        }
+
+        function checkbox(code, state, checked) {
+            const cb = el('input', {type: 'checkbox', checked});
+            cb.addEventListener('change', () => setState(code, state, cb.checked));
+            return el('td', {className: 'text-center'}, cb);
+        }
+
+        let lastData = null;
+        const REDEEM_URL = 'https://shift.gearboxsoftware.com/rewards';
+
+        function showExpired() { return $('show-expired').checked; }
+
+        function renderCodes(data) {
+            lastData = data;
+            $('last-checked').textContent = `Last checked: ${data.last_checked || 'Never'}`;
+            $('last-error').textContent = data.last_error ? `Last check failed: ${data.last_error}` : '';
+            const tbody = $('code-list');
+            tbody.replaceChildren();
+            const expiredCount = data.codes.filter(c => c.expired).length;
+            const visible = showExpired() ? data.codes : data.codes.filter(c => !c.expired);
+            $('counts').textContent = `${data.codes.length - expiredCount} active, ${expiredCount} expired` + (showExpired() ? '' : ' (hidden)');
+            if (!visible.length) {
+                tbody.append(el('tr', {}, el('td', {colSpan: 6, className: 'text-center py-4 text-[#8b949e]', textContent: data.codes.length ? 'No active codes.' : 'No codes found.'})));
+                return;
+            }
+            visible.forEach(c => {
+                const row = el('tr', {className: c.expired ? 'expired' : ''});
+
+                const copyBtn = el('button', {className: 'copy-button float-right', textContent: 'Copy'});
+                copyBtn.addEventListener('click', () => copyToClipboard(c.code, copyBtn));
+                // window.open must run synchronously inside the click or popup blockers stop it
+                const redeemBtn = el('button', {className: 'redeem-button float-right', textContent: 'Redeem', title: 'Copy code and open the SHiFT redeem page'});
+                redeemBtn.addEventListener('click', () => { window.open(REDEEM_URL, '_blank', 'noopener'); copyToClipboard(c.code, redeemBtn); });
+                row.append(el('td', {className: 'font-mono'}, el('span', {className: 'mr-4', textContent: c.code}), copyBtn, redeemBtn));
+
+                const source = el('td');
+                if (c.source_url && c.source_url.startsWith('https://')) {
+                    source.append(el('a', {href: c.source_url, target: '_blank', rel: 'noopener', textContent: c.source}));
+                } else {
+                    source.textContent = c.source;
+                }
+                row.append(source);
+
+                const posted = c.posted_at ? new Date(c.posted_at).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : c.found;
+                row.append(el('td', {textContent: posted}), el('td', {textContent: c.expires || 'N/A'}));
+                row.append(checkbox(c.code, 'activated', c.activated), checkbox(c.code, 'expired', c.expired_manually));
+                tbody.append(row);
+            });
+        }
+
+        async function fetchCodes() {
+            try { renderCodes(await (await fetch('/api/codes')).json()); }
+            catch (error) { console.error('Error:', error); }
+        }
+
+        async function showSteamJson() {
+            $('steam-json-content').textContent = JSON.stringify(await (await fetch('/api/steam-json')).json(), null, 2);
+            $('steam-modal').style.display = 'flex';
+        }
+        async function showSteamBbcode() {
+            $('bbcode-content').textContent = (await (await fetch('/api/steam-bbcode')).json()).content;
+            $('bbcode-modal').style.display = 'flex';
+        }
+        async function fetchLogs() {
+            const logs = await (await fetch('/api/logs')).json();
+            $('logs-content').replaceChildren(...logs.map(l => el('div', {className: 'log-entry', textContent: l})));
+        }
+        async function showLogs() { await fetchLogs(); $('logs-modal').style.display = 'flex'; }
+
+        async function checkNow(btn) {
+            const res = await fetch('/api/check-now', {method: 'POST'});
+            const data = await res.json();
+            const original = btn.textContent;
+            btn.textContent = res.ok ? 'Checking...' : `Wait ${data.retry_in}s`;
+            setTimeout(() => { btn.textContent = original; fetchCodes(); }, res.ok ? 5000 : 3000);
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            $('btn-json').addEventListener('click', showSteamJson);
+            $('btn-bbcode').addEventListener('click', showSteamBbcode);
+            $('btn-logs').addEventListener('click', showLogs);
+            $('btn-logs-refresh').addEventListener('click', fetchLogs);
+            $('btn-check').addEventListener('click', (e) => checkNow(e.currentTarget));
+            document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', closeModals));
+            document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', () => copyToClipboard($(b.dataset.copy).textContent, b)));
+            try { $('show-expired').checked = localStorage.getItem('showExpired') === '1'; } catch (e) {}
+            $('show-expired').addEventListener('change', () => {
+                try { localStorage.setItem('showExpired', showExpired() ? '1' : '0'); } catch (e) {}
+                if (lastData) renderCodes(lastData);
+            });
+            fetchCodes();
+            setInterval(fetchCodes, 60000);
+        });
+    </script>
+</body>
+</html>

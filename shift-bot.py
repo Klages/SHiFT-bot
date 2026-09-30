@@ -1,383 +1,514 @@
-import requests
-import re
+import html
 import json
-import feedparser
-from datetime import datetime
-import time
-from flask import Flask, jsonify, request
+import os
+import random
+import re
+import sys
+import tempfile
 import threading
-import io
+import time
+from datetime import date, datetime, timedelta, timezone
+
+import feedparser
+import requests
+import waitress
+from flask import Flask, jsonify, request, send_from_directory
 
 # ---------------- CONFIG ----------------
-STORAGE_FILE = "shift_codes_state.json"
-CHECK_INTERVAL = 30 * 60  # 30 minutes
-REDDIT_URL = "https://www.reddit.com/r/BorderlandsShiftCodes/new.json?limit=50"
-HEADERS = {"User-Agent": "BL4CodeTracker/1.0 (by /u/VaultHunter_Alpha)"}
-TWITTER_ACCOUNTS = ["GearboxOfficial", "Borderlands"]
-import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
+STORAGE_FILE = os.path.join(DATA_DIR, "shift_codes_state.json")
+LEGACY_STORAGE_FILE = "shift_codes_state.json"  # old location, imported once if found
+
+CHECK_INTERVAL = max(5, int(os.environ.get("CHECK_INTERVAL_MINUTES", "120"))) * 60
+NOTIFY_MAX_AGE_DAYS = 3
+ALERT_AFTER_FAILURES = 3  # consecutive failed checks before a Discord outage alert
+DISCORD_DELAY = 1
+MANUAL_CHECK_COOLDOWN = 120  # Reddit allows very few unauthenticated requests per window
+
+# The RSS feed is served to unauthenticated clients that identify themselves honestly.
+# The .json endpoint is blocked (403) and browser-like User-Agents get rate limited (429).
+REDDIT_URL = "https://www.reddit.com/r/BorderlandsShiftCodes/new/.rss?limit=50"
+USER_AGENT = os.environ.get(
+    "REDDIT_USER_AGENT",
+    "windows:bl4-shift-tracker:2.0 (self-hosted personal tool)",
+)
+
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-BL4_KEYWORDS = ["borderlands 4", "bl4"]
-OTHER_GAMES_KEYWORDS = [
-    r"\bbl2\b", r"\bborderlands 2\b",
-    r"\bbl3\b", r"\bborderlands 3\b",
-    r"\btps\b", r"\bborderlands: the pre-sequel\b",
-    r"\bborderlands goty\b",
-    r"\bwonderlands\b"
-]
-OTHER_GAMES_REGEX = re.compile("|".join(OTHER_GAMES_KEYWORDS), re.IGNORECASE)
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "5000"))
+
 BL4_RELEASE_UTC = 1757702400  # Sep 12, 2025 UTC
 # ----------------------------------------
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
+app.json.sort_keys = False  # keep the newest-first order in JSON responses
 
-# GLOBAL STATE & LOGGING SYSTEM
+# ---------------- GLOBAL STATE & LOGGING ----------------
+state_lock = threading.Lock()
+wake_event = threading.Event()
 last_checked_at = None
+last_error = None
+last_manual_check = 0.0
 LOGS = []
 MAX_LOGS = 100
+log_lock = threading.Lock()
+
 
 def log(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    full_msg = f"[{timestamp}] {message}"
-    print(full_msg)
-    global LOGS
-    LOGS.insert(0, full_msg)
-    if len(LOGS) > MAX_LOGS:
-        LOGS = LOGS[:MAX_LOGS]
-
-def load_codes_and_state():
+    full_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
     try:
-        with open(STORAGE_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        print(full_msg, flush=True)
+    except UnicodeEncodeError:  # e.g. a Windows cp1252 console can't show emoji
+        print(full_msg.encode("ascii", "replace").decode("ascii"), flush=True)
+    with log_lock:
+        LOGS.insert(0, full_msg)
+        del LOGS[MAX_LOGS:]
 
-def save_codes_and_state(codes):
-    with open(STORAGE_FILE, "w") as f:
-        json.dump(codes, f, indent=2)
 
-CODE_PATTERN = re.compile(r"[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}", re.IGNORECASE)
-EXPIRY_PATTERN = re.compile(r"(?:expir(?:es|y)|valid\s+until)[:\-]?\s*(\w+\s\d{1,2},?\s?\d{4}?)", re.IGNORECASE)
-
-# ---------------- DISCORD NOTIFICATION ----------------
-def send_discord_notification(new_code_data):
-    if not DISCORD_WEBHOOK_URL: return
-
-    embed = {
-        "title": "✨ New Borderlands 4 SHiFT Code Found!",
-        "color": 15844367,
-        "fields": [
-            {"name": "Code", "value": f"```{new_code_data['code']}```", "inline": False},
-            {"name": "Expires", "value": new_code_data['expires'] or "N/A", "inline": True},
-            {"name": "Source", "value": f"[{new_code_data['source']}]({new_code_data['source_url']})", "inline": True}
-        ],
-        "footer": {"text": "BL4 SHiFT Code Tracker"},
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
+# ---------------- STORAGE ----------------
+def _parse_iso(value):
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"username": "SHiFT Code Bot", "embeds": [embed]}, timeout=10)
-    except Exception as e:
-        log(f"⚠️ Discord notification failed: {e}")
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
-# ---------------- FETCHERS ----------------
-def fetch_reddit_codes():
-    results = []
-    try:
-        resp = requests.get(REDDIT_URL, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        log(f"⚠️ Error fetching from Reddit: {e}")
-        return results
 
-    posts = data.get("data", {}).get("children", [])
-    for post in posts:
-        pdata = post.get("data", {})
-        if pdata.get("created_utc", 0) < BL4_RELEASE_UTC: continue
-
-        title = pdata.get("title", "").lower()
-        body = pdata.get("selftext", "").lower()
-        full_text = title + "\n" + body
-        permalink = pdata.get("permalink", "")
-        source_url = f"https://www.reddit.com{permalink}" if permalink else REDDIT_URL
-
-        lines = [l.strip() for l in full_text.splitlines() if l.strip()]
-        for i, line in enumerate(lines):
-            codes = CODE_PATTERN.findall(line)
-            if not codes: continue
-            
-            start = max(0, i-3)
-            context = " ".join(lines[start:i+1]).lower()
-            if not (any(k in context for k in BL4_KEYWORDS) and not OTHER_GAMES_REGEX.search(context)):
-                continue
-
-            expiry_match = EXPIRY_PATTERN.search(context)
-            expiry = expiry_match.group(1) if expiry_match else ""
-            for code in codes:
-                results.append({
-                    "code": code.upper(), 
-                    "expires": expiry, 
-                    "source": "Reddit",
-                    "source_url": source_url
-                })
-    return results
-
-def fetch_twitter_codes():
-    results = []
-    for user in TWITTER_ACCOUNTS:
+def _migrate_entry(entry):
+    """Older versions stored 'found' as a display string only; add a sortable timestamp."""
+    if not entry.get("found_at"):
         try:
-            feed = feedparser.parse(f"https://twitrss.me/twitter_user_to_rss/?user={user}")
-        except Exception as e:
-            log(f"⚠️ Error fetching Twitter {user}: {e}")
+            naive = datetime.strptime(entry.get("found", ""), "%b %d, %Y, %H:%M")
+            entry["found_at"] = naive.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            entry["found_at"] = datetime.fromtimestamp(0, timezone.utc).isoformat()
+    entry.pop("found", None)
+    return entry
+
+
+def load_state():
+    for path in (STORAGE_FILE, LEGACY_STORAGE_FILE):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {code: _migrate_entry(e) for code, e in data.items()}
+        except FileNotFoundError:
+            continue
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
+            log(f"⚠️ Could not read {path}: {e}")
+    return {}
+
+
+def save_state(codes):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(codes, f, indent=2)
+        os.replace(tmp, STORAGE_FILE)  # atomic: a crash can't leave a half-written file
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+# ---------------- PARSING ----------------
+CODE_PATTERN = re.compile(r"(?<![A-Z0-9-])[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}(?![A-Z0-9-])", re.IGNORECASE)
+
+BL4_RE = re.compile(
+    r"\bbl\s?4\b|\bborderlands\s*4\b|\bborderlands\s*1\W+2\W+3\W+(?:and\s+)?4\b",
+    re.IGNORECASE,
+)
+MULTI_RE = re.compile(r"\bmulti\b|\ball\s+(?:the\s+)?(?:games|borderlands)\b|\bevery\s+game\b", re.IGNORECASE)
+OTHER_RE = re.compile(
+    r"\bbl\s?[123]\b|\bborderlands\s*[123]\b|\btps\b|\bpre-?sequel\b|\bwonderlands\b|\bgoty\b",
+    re.IGNORECASE,
+)
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_MONTH = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+_LEAD = r"(?:expir\w*|valid\s+(?:until|through|thru|till)|until|through|thru)\W{0,4}(?:on\s+)?"
+EXPIRY_NUMERIC = re.compile(_LEAD + r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", re.IGNORECASE)
+EXPIRY_MONTH_FIRST = re.compile(_LEAD + _MONTH + r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?", re.IGNORECASE)
+EXPIRY_DAY_FIRST = re.compile(_LEAD + r"(\d{1,2})(?:st|nd|rd|th)?\s+" + _MONTH + r"(?:,?\s*(\d{4}))?", re.IGNORECASE)
+
+
+def html_to_text(raw):
+    raw = re.split(r"submitted\s+by", raw, maxsplit=1, flags=re.IGNORECASE)[0]
+    raw = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</h\d>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    return html.unescape(raw)
+
+
+def parse_expiry(text, posted):
+    """Return the expiry as a date, or None. Years are inferred from the post date."""
+    def build(month, day, year):
+        try:
+            if year:
+                year = int(year)
+                year += 2000 if year < 100 else 0
+                return date(year, month, day)
+            d = date(posted.year, month, day)
+            # "Expires 1/3" in a late-December post means next January.
+            return d if d >= posted.date() - timedelta(days=60) else date(posted.year + 1, month, day)
+        except ValueError:
+            return None
+
+    if m := EXPIRY_NUMERIC.search(text):
+        return build(int(m.group(1)), int(m.group(2)), m.group(3))
+    if m := EXPIRY_MONTH_FIRST.search(text):
+        return build(MONTHS[m.group(1).lower()], int(m.group(2)), m.group(3))
+    if m := EXPIRY_DAY_FIRST.search(text):
+        return build(MONTHS[m.group(2).lower()], int(m.group(1)), m.group(3))
+    return None
+
+
+def classify(text):
+    """Returns 'bl4', 'other' or None (no game mentioned)."""
+    if BL4_RE.search(text) or MULTI_RE.search(text):
+        return "bl4"
+    if OTHER_RE.search(text):
+        return "other"
+    return None
+
+
+def extract_codes(title, body, posted):
+    """Yield (code, expiry_date) for every code in a post that is valid for Borderlands 4."""
+    lines = [l.strip() for l in (title + "\n" + body).splitlines() if l.strip()]
+    title_class = classify(title)
+    code_lines = {i for i, l in enumerate(lines) if CODE_PATTERN.search(l)}
+    unique_codes = {c.upper() for l in lines for c in CODE_PATTERN.findall(l)}
+    results = []
+
+    for i in sorted(code_lines):
+        # Game context: this line plus up to 3 lines above it, stopping at the previous code
+        # so "BL3: AAAAA-..." / "BL4: BBBBB-..." lists don't leak into each other.
+        context = [lines[i]]
+        for j in range(i - 1, max(-1, i - 4), -1):
+            if j in code_lines:
+                break
+            context.insert(0, lines[j])
+        game = classify("\n".join(context)) or title_class
+        if game != "bl4":
             continue
 
-        for entry in feed.entries:
-            text = (entry.title + " " + entry.get("description", "")).lower()
-            if not hasattr(entry, 'published_parsed') or entry.published_parsed is None: continue
-            if time.mktime(entry.published_parsed) < BL4_RELEASE_UTC: continue
-            if not any(k in text for k in BL4_KEYWORDS): continue
-            if OTHER_GAMES_REGEX.search(text): continue
+        # Expiry: this line and the lines below it up to the next code; a post with a
+        # single code may state it anywhere.
+        after = [lines[i]]
+        for j in range(i + 1, min(len(lines), i + 3)):
+            if j in code_lines:
+                break
+            after.append(lines[j])
+        expiry = parse_expiry(" ".join(after), posted)
+        if expiry is None and len(unique_codes) == 1:
+            expiry = parse_expiry(" ".join(lines), posted)
 
-            codes = CODE_PATTERN.findall(text)
-            expiry_match = EXPIRY_PATTERN.search(text)
-            expiry = expiry_match.group(1) if expiry_match else ""
-            for code in codes:
-                results.append({
-                    "code": code.upper(), 
-                    "expires": expiry, 
-                    "source": "Twitter",
-                    "source_url": entry.get("link", "")
-                })
+        for code in CODE_PATTERN.findall(lines[i]):
+            results.append((code.upper(), expiry))
     return results
 
+
+def parse_feed(feed_bytes):
+    results = []
+    feed = feedparser.parse(feed_bytes)
+    for entry in feed.entries:
+        published = entry.get("published_parsed") or entry.get("updated_parsed")
+        if not published:
+            continue
+        posted = datetime(*published[:6], tzinfo=timezone.utc)
+        if posted.timestamp() < BL4_RELEASE_UTC:
+            continue
+
+        content = entry.get("content")
+        body = html_to_text(content[0]["value"] if content else entry.get("summary", ""))
+        title = html.unescape(entry.get("title", ""))
+        link = entry.get("link", "")
+        source_url = link if link.startswith("https://") else ""
+
+        for code, expiry in extract_codes(title, body, posted):
+            results.append({
+                "code": code,
+                "posted_at": posted.isoformat(),
+                "expires_date": expiry.isoformat() if expiry else "",
+                "source": "Reddit",
+                "source_url": source_url,
+            })
+    return results
+
+
+# ---------------- FETCHING ----------------
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/atom+xml, application/rss+xml, */*"})
+
+
+def fetch_reddit_codes():
+    """Returns (results, error, retry_after_seconds)."""
+    try:
+        resp = session.get(REDDIT_URL, timeout=15)
+    except requests.RequestException as e:
+        return [], f"Reddit request failed: {e}", None
+
+    if resp.status_code == 429:
+        retry = resp.headers.get("Retry-After") or resp.headers.get("x-ratelimit-reset") or "60"
+        try:
+            wait = float(retry)
+        except ValueError:
+            wait = 60.0
+        return [], "Reddit rate limit hit (429)", wait + 5
+    if resp.status_code == 403:
+        return [], "Reddit refused the request (403) - backing off", 900
+    if resp.status_code != 200:
+        return [], f"Reddit returned HTTP {resp.status_code}", None
+
+    try:
+        return parse_feed(resp.content), None, None
+    except Exception as e:  # malformed feed shouldn't kill the worker
+        return [], f"Could not parse Reddit feed: {e}", None
+
+
+# ---------------- DISCORD ----------------
+def send_discord_notification(entry):
+    fields = [
+        {"name": "Code", "value": f"```{entry['code']}```", "inline": False},
+        {"name": "Expires", "value": format_date(entry.get("expires_date")) or "N/A", "inline": True},
+    ]
+    if entry.get("source_url"):
+        fields.append({"name": "Source", "value": f"[{entry['source']}]({entry['source_url']})", "inline": True})
+    post_discord({
+        "title": "✨ New Borderlands 4 SHiFT Code Found!",
+        "color": 15844367,
+        "fields": fields,
+    })
+
+
+def post_discord(embed):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    embed = dict(embed, footer={"text": "BL4 SHiFT Code Tracker"}, timestamp=datetime.now(timezone.utc).isoformat())
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"username": "SHiFT Code Bot", "embeds": [embed]}, timeout=10)
+    except requests.RequestException as e:
+        log(f"⚠️ Discord notification failed: {e}")
+
+
 # ---------------- BACKGROUND WORKER ----------------
-def background_code_checker():
-    global last_checked_at
-    while True:
-        log("🕒 Checking for new SHiFT codes...")
-        seen_codes = load_codes_and_state()
-        fetched = fetch_reddit_codes() + fetch_twitter_codes()
-        now_str = datetime.now().strftime("%b %d, %Y, %H:%M")
-        
+def format_date(iso_date):
+    try:
+        return date.fromisoformat(iso_date).strftime("%b %d, %Y")
+    except (TypeError, ValueError):
+        return ""
+
+
+def is_expired(entry):
+    if entry.get("expired_manually"):
+        return True
+    try:
+        return date.fromisoformat(entry.get("expires_date", "")) < date.today()
+    except ValueError:
+        return False
+
+
+def check_once():
+    """One scrape + merge. Returns (ok, retry_after)."""
+    global last_checked_at, last_error
+    fetched, error, retry_after = fetch_reddit_codes()
+    if error:
+        last_error = error
+        log(f"⚠️ {error}")
+        return False, retry_after
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    new_entries = []
+    with state_lock:
+        seen = load_state()
         for item in fetched:
             code = item["code"]
-            if code not in seen_codes:
-                log(f"✨ New code found: {code}")
-                new_obj = {
+            if code not in seen:
+                seen[code] = {
                     "code": code,
-                    "found": now_str,
-                    "expires": item["expires"],
+                    "found_at": now_iso,
+                    "posted_at": item["posted_at"],
+                    "expires_date": item["expires_date"],
                     "activated": False,
                     "expired_manually": False,
                     "source": item["source"],
-                    "source_url": item.get("source_url", "")
+                    "source_url": item["source_url"],
                 }
-                seen_codes[code] = new_obj
-                send_discord_notification(new_obj)
+                new_entries.append(seen[code])
+                log(f"✨ New code found: {code}")
             else:
-                if seen_codes[code].get("expires") != item.get("expires"):
-                    seen_codes[code]["expires"] = item.get("expires")
-                if not seen_codes[code].get("source_url") and item.get("source_url"):
-                    seen_codes[code]["source_url"] = item.get("source_url")
+                existing = seen[code]
+                if item["expires_date"] and existing.get("expires_date") != item["expires_date"]:
+                    existing["expires_date"] = item["expires_date"]
+                if not existing.get("source_url") and item["source_url"]:
+                    existing["source_url"] = item["source_url"]
+                if not existing.get("posted_at"):
+                    existing["posted_at"] = item["posted_at"]
+        save_state(seen)
 
-        save_codes_and_state(seen_codes)
-        last_checked_at = now_str
-        log(f"✅ Check complete. Next check in {CHECK_INTERVAL / 60:.0f} minutes.")
-        time.sleep(CHECK_INTERVAL)
+    # Only announce recent codes so importing the feed's backlog doesn't flood Discord.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NOTIFY_MAX_AGE_DAYS)
+    for entry in new_entries:
+        posted = _parse_iso(entry["posted_at"])
+        if posted and posted >= cutoff and not is_expired(entry):
+            send_discord_notification(entry)
+            time.sleep(DISCORD_DELAY)  # stay under Discord's webhook rate limit
+
+    last_checked_at = datetime.now().strftime("%b %d, %Y, %H:%M")
+    last_error = None
+    return True, None
+
+
+def next_wait(failures, retry_after):
+    """Seconds to sleep after a check: the normal interval, or an exponential back-off."""
+    if failures == 0:
+        return CHECK_INTERVAL
+    return max(retry_after or 0, min(CHECK_INTERVAL, 60 * 2 ** failures)) + random.uniform(0, 15)
+
+
+def track_outage(failures, error, alerted):
+    """Send one Discord alert when checks keep failing and one when they recover.
+    Returns the new 'alerted' flag."""
+    if failures >= ALERT_AFTER_FAILURES and not alerted:
+        post_discord({
+            "title": "⚠️ SHiFT tracker can't reach Reddit",
+            "color": 15158332,
+            "description": f"{failures} checks in a row failed.\nLast error: {error}",
+        })
+        return True
+    if failures == 0 and alerted:
+        post_discord({"title": "✅ SHiFT tracker is working again", "color": 3066993})
+        return False
+    return alerted
+
+
+def background_code_checker():
+    global last_error
+    failures = 0
+    alerted = False
+    while True:
+        wake_event.clear()
+        log("🕒 Checking for new SHiFT codes...")
+        try:
+            ok, retry_after = check_once()
+        except Exception as e:  # keep the worker alive whatever happens
+            last_error = f"Unexpected error: {e}"
+            log(f"⚠️ Unexpected error during check: {e}")
+            ok, retry_after = False, None
+
+        failures = 0 if ok else failures + 1
+        alerted = track_outage(failures, last_error, alerted)
+        wait = next_wait(failures, retry_after)
+        if ok:
+            log(f"✅ Check complete. Next check in {wait / 60:.0f} minutes.")
+        else:
+            log(f"Retrying in {wait / 60:.1f} minutes.")
+        wake_event.wait(wait)  # a manual "check now" sets this event
+
 
 # ---------------- API ENDPOINTS ----------------
-@app.route('/')
+def sort_key(entry):
+    dt = _parse_iso(entry.get("posted_at")) or _parse_iso(entry.get("found_at"))
+    return dt or datetime.fromtimestamp(0, timezone.utc)
+
+
+def public_view(entry):
+    found = _parse_iso(entry.get("found_at"))
+    return {
+        "code": entry["code"],
+        "source": entry.get("source", ""),
+        "source_url": entry.get("source_url", ""),
+        "posted_at": entry.get("posted_at") or entry.get("found_at"),
+        "found": found.astimezone().strftime("%b %d, %Y, %H:%M") if found else "",
+        "expires": format_date(entry.get("expires_date")) or entry.get("expires", ""),
+        "activated": bool(entry.get("activated")),
+        "expired_manually": bool(entry.get("expired_manually")),
+        "expired": is_expired(entry),
+    }
+
+
+def sorted_entries(seen):
+    return sorted(seen.values(), key=sort_key, reverse=True)
+
+
+@app.route("/")
 def index():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>BL4 SHiFT Codes</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
-            body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
-            .container { max-width: 1000px; }
-            .code-table { width: 100%; border-collapse: collapse; }
-            .code-table th, .code-table td { padding: 12px; border-bottom: 1px solid #30363d; text-align: left; }
-            .code-table th { background-color: #161b22; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em; }
-            .code-table tr:hover { background-color: #21262d; }
-            .code-table tbody tr.expired { color: #8b949e; text-decoration: line-through; }
-            .copy-button { background-color: #238636; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; min-width: 80px; }
-            .copy-button:hover { background-color: #2ea043; }
-            .header-text { background-clip: text; -webkit-background-clip: text; color: transparent; background-image: linear-gradient(to right, #63a4ff, #8338ec); }
-            input[type="checkbox"] { appearance: none; width: 18px; height: 18px; border: 2px solid #58a6ff; border-radius: 4px; cursor: pointer; position: relative; }
-            input[type="checkbox"]:checked { background-color: #58a6ff; }
-            input[type="checkbox"]:checked::before { content: '✓'; color: #0d1117; font-size: 14px; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
-            .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.7); display: none; align-items: center; justify-content: center; z-index: 1000; }
-            .modal-content { background-color: #161b22; padding: 24px; border-radius: 8px; max-width: 90%; max-height: 90%; overflow: auto; }
-            .modal-content pre { background-color: #0d1117; padding: 16px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
-            .log-entry { font-family: monospace; font-size: 12px; border-bottom: 1px solid #30363d; padding: 4px 0; }
-            a { color: #58a6ff; text-decoration: none; }
-            a:hover { text-decoration: underline; }
-        </style>
-    </head>
-    <body class="p-6">
-        <div class="container mx-auto p-8 bg-[#161b22] rounded-lg shadow-lg">
-            <h1 class="text-3xl font-bold mb-6 text-center header-text">BL4 SHiFT Code Tracker</h1>
-            <p class="text-center mb-4 text-[#8b949e]">Automatically fetches codes from Reddit and Twitter.</p>
-            <p id="last-checked" class="text-center text-sm text-[#8b949e] mb-8"></p>
-            
-            <div class="flex flex-wrap justify-center gap-4 mb-8">
-                <button onclick="showSteamJson()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Show Steam JSON</button>
-                <button onclick="showSteamBbcode()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded">Show Steam BBCode</button>
-                <button onclick="showLogs()" class="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">Show Logs</button>
-                <a href="https://shift.gearboxsoftware.com/rewards" target="_blank" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded flex items-center">Activate Codes</a>
-            </div>
+    return send_from_directory(os.path.join(BASE_DIR, "static"), "index.html")
 
-            <table class="code-table rounded-lg overflow-hidden">
-                <thead>
-                    <tr>
-                        <th class="rounded-tl-lg">Code</th><th>Source</th><th>Found</th><th>Expires</th><th class="text-center">Activated</th><th class="rounded-tr-lg text-center">Expired</th>
-                    </tr>
-                </thead>
-                <tbody id="code-list">
-                    <tr><td colspan="6" class="text-center py-4 text-[#8b949e]">Loading codes...</td></tr>
-                </tbody>
-            </table>
-        </div>
 
-        <div id="steam-modal" class="modal-overlay"><div class="modal-content"><h2 class="text-2xl font-bold mb-4">Steam Formatted JSON</h2><pre id="steam-json-content" class="text-sm"></pre><div class="mt-4 flex justify-end gap-2"><button onclick="copyElementText('steam-json-content', this)" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Copy</button><button onclick="closeModals()" class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">Close</button></div></div></div>
-        <div id="bbcode-modal" class="modal-overlay"><div class="modal-content"><h2 class="text-2xl font-bold mb-4">Steam Formatted BBCode</h2><pre id="bbcode-content" class="text-sm"></pre><div class="mt-4 flex justify-end gap-2"><button onclick="copyElementText('bbcode-content', this)" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Copy</button><button onclick="closeModals()" class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">Close</button></div></div></div>
-        <div id="logs-modal" class="modal-overlay"><div class="modal-content" style="width: 800px;"><h2 class="text-2xl font-bold mb-4">System Logs</h2><div id="logs-content" class="bg-[#0d1117] p-4 rounded h-64 overflow-y-auto"></div><div class="mt-4 flex justify-end gap-2"><button onclick="fetchLogs()" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded">Refresh</button><button onclick="closeModals()" class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">Close</button></div></div></div>
-
-        <script>
-            async function copyToClipboard(text, btn) {
-                let success = false;
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                    try { await navigator.clipboard.writeText(text); success = true; } 
-                    catch (err) { console.warn("Clipboard API failed"); }
-                }
-                
-                if (!success) {
-                    try {
-                        const ta = document.createElement("textarea"); ta.value = text; 
-                        ta.style.position = "fixed"; ta.style.left = "-9999px";
-                        document.body.appendChild(ta); ta.focus(); ta.select();
-                        success = document.execCommand('copy'); 
-                        document.body.removeChild(ta);
-                    } catch (err) { console.error('Copy failed.'); }
-                }
-
-                if (success && btn) {
-                    const original = btn.textContent;
-                    btn.textContent = 'Copied!';
-                    setTimeout(() => btn.textContent = original, 2000);
-                }
-            }
-            
-            function copyElementText(id, btn) { copyToClipboard(document.getElementById(id).textContent, btn); }
-            function closeModals() { document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none'); }
-
-            async function fetchCodes() {
-                try {
-                    const response = await fetch('/api/codes');
-                    renderCodes(await response.json());
-                } catch (error) { console.error('Error:', error); }
-            }
-
-            function renderCodes(data) {
-                document.getElementById('last-checked').textContent = `Last checked: ${data.last_checked || 'Never'}`;
-                const tbody = document.getElementById('code-list');
-                tbody.innerHTML = '';
-                if (!data.codes.length) { tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-[#8b949e]">No codes found.</td></tr>'; return; }
-                
-                data.codes.forEach(c => {
-                    const row = document.createElement('tr');
-                    if (c.expired_manually) row.className = 'expired';
-                    const sourceLink = c.source_url ? `<a href="${c.source_url}" target="_blank">${c.source}</a>` : c.source;
-                    row.innerHTML = `
-                        <td class="font-mono"><span class="mr-4">${c.code}</span><button class="copy-button float-right" onclick="copyToClipboard('${c.code}', this)">Copy</button></td>
-                        <td>${sourceLink}</td>
-                        <td>${c.found}</td><td>${c.expires || 'N/A'}</td>
-                        <td class="text-center"><input type="checkbox" data-code="${c.code}" data-state="activated" ${c.activated ? 'checked' : ''}></td>
-                        <td class="text-center"><input type="checkbox" data-code="${c.code}" data-state="expired" ${c.expired_manually ? 'checked' : ''}></td>
-                    `;
-                    tbody.appendChild(row);
-                });
-                
-                document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                    cb.addEventListener('change', async (e) => {
-                        await fetch('/api/codes', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({code: e.target.dataset.code, state: e.target.dataset.state, value: e.target.checked})
-                        });
-                        fetchCodes();
-                    });
-                });
-            }
-
-            async function showSteamJson() {
-                const res = await fetch('/api/steam-json');
-                document.getElementById('steam-json-content').textContent = JSON.stringify(await res.json(), null, 2);
-                document.getElementById('steam-modal').style.display = 'flex';
-            }
-            async function showSteamBbcode() {
-                const res = await fetch('/api/steam-bbcode');
-                document.getElementById('bbcode-content').textContent = (await res.json()).content;
-                document.getElementById('bbcode-modal').style.display = 'flex';
-            }
-            async function showLogs() { await fetchLogs(); document.getElementById('logs-modal').style.display = 'flex'; }
-            async function fetchLogs() {
-                const res = await fetch('/api/logs');
-                document.getElementById('logs-content').innerHTML = (await res.json()).map(l => `<div class="log-entry">${l}</div>`).join('');
-            }
-
-            document.addEventListener('DOMContentLoaded', () => { fetchCodes(); setInterval(fetchCodes, 60000); });
-        </script>
-    </body>
-    </html>
-    """
-
-@app.route('/api/codes', methods=['GET', 'POST'])
+@app.route("/api/codes", methods=["GET", "POST"])
 def handle_codes():
-    if request.method == 'GET':
-        seen = load_codes_and_state()
-        return jsonify({"codes": sorted(seen.values(), key=lambda x: x["found"], reverse=True), "last_checked": last_checked_at})
-    
-    data = request.get_json()
-    seen = load_codes_and_state()
-    if data['code'] in seen:
-        if data['state'] == "activated": seen[data['code']]["activated"] = data['value']
-        elif data['state'] == "expired": seen[data['code']]["expired_manually"] = data['value']
-        save_codes_and_state(seen)
-        return jsonify({"status": "success"})
-    return jsonify({"status": "error"}), 404
+    if request.method == "GET":
+        with state_lock:
+            seen = load_state()
+        return jsonify({
+            "codes": [public_view(e) for e in sorted_entries(seen)],
+            "last_checked": last_checked_at,
+            "last_error": last_error,
+        })
 
-@app.route('/api/steam-json')
+    data = request.get_json(silent=True) or {}
+    field = {"activated": "activated", "expired": "expired_manually"}.get(data.get("state"))
+    if field is None or not isinstance(data.get("value"), bool) or not isinstance(data.get("code"), str):
+        return jsonify({"status": "error", "message": "invalid request"}), 400
+    with state_lock:
+        seen = load_state()
+        if data["code"] not in seen:
+            return jsonify({"status": "error", "message": "unknown code"}), 404
+        seen[data["code"]][field] = data["value"]
+        save_state(seen)
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/check-now", methods=["POST"])
+def check_now():
+    global last_manual_check
+    wait = MANUAL_CHECK_COOLDOWN - (time.time() - last_manual_check)
+    if wait > 0:
+        return jsonify({"status": "cooldown", "retry_in": int(wait) + 1}), 429
+    last_manual_check = time.time()
+    wake_event.set()
+    return jsonify({"status": "started"})
+
+
+@app.route("/api/steam-json")
 def steam_json():
-    seen = load_codes_and_state()
-    return jsonify({k: {"expires": v.get("expires", ""), "found": v.get("found", ""), "source_url": v.get("source_url", "")} 
-                    for k, v in seen.items() if not v.get("expired_manually")})
+    with state_lock:
+        seen = load_state()
+    return jsonify({
+        e["code"]: {
+            "expires": format_date(e.get("expires_date")) or e.get("expires", ""),
+            "found": public_view(e)["found"],
+            "source_url": e.get("source_url", ""),
+        }
+        for e in sorted_entries(seen) if not is_expired(e)
+    })
 
-@app.route('/api/steam-bbcode')
+
+@app.route("/api/steam-bbcode")
 def steam_bbcode():
-    seen = load_codes_and_state()
-    # Explicitly filter out expired codes
-    active_codes = sorted([c for c in seen.values() if not c.get("expired_manually")], key=lambda x: x["found"], reverse=True)
-    
-    # Generate TABLE Format (Without "Expired" column)
-    text = "[table]\n"
-    text += "[tr][th]Shift Code[/th][th]Found[/th][/tr]\n"
-    
-    for c in active_codes:
-        text += f"[tr][td]{c['code']}[/td][td]{c['found']}[/td][/tr]\n"
-        
+    with state_lock:
+        seen = load_state()
+    active = [e for e in sorted_entries(seen) if not is_expired(e)]
+    text = "[table]\n[tr][th]Shift Code[/th][th]Found[/th][/tr]\n"
+    for e in active:
+        text += f"[tr][td]{e['code']}[/td][td]{public_view(e)['found']}[/td][/tr]\n"
     text += "[/table]"
     return jsonify({"content": text})
 
-@app.route('/api/logs')
+
+@app.route("/api/logs")
 def get_logs():
-    return jsonify(LOGS)
+    with log_lock:
+        return jsonify(list(LOGS))
+
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    log(f"State file: {STORAGE_FILE}")
     threading.Thread(target=background_code_checker, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+    log(f"Dashboard: http://{HOST}:{PORT}")
+    waitress.serve(app, host=HOST, port=PORT, threads=4)
