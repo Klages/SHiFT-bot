@@ -74,8 +74,14 @@ def _parse_iso(value):
         return None
 
 
-def _migrate_entry(entry):
-    """Older versions stored 'found' as a display string only; add a sortable timestamp."""
+def _migrate_entry(code, entry):
+    """Bring entries written by older versions up to the current schema.
+
+    Older files may lack fields entirely (the code was sometimes only the dict key), so every
+    field the rest of the app reads gets a default here."""
+    if not isinstance(entry, dict):
+        entry = {}
+    entry["code"] = entry.get("code") or code
     if not entry.get("found_at"):
         try:
             naive = datetime.strptime(entry.get("found", ""), "%b %d, %Y, %H:%M")
@@ -83,6 +89,11 @@ def _migrate_entry(entry):
         except ValueError:
             entry["found_at"] = datetime.fromtimestamp(0, timezone.utc).isoformat()
     entry.pop("found", None)
+    entry.setdefault("activated", False)
+    entry.setdefault("expired_manually", False)
+    entry.setdefault("source", "Reddit")
+    entry.setdefault("source_url", "")
+    entry.setdefault("expires_date", "")
     return entry
 
 
@@ -91,7 +102,7 @@ def load_state():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return {code: _migrate_entry(e) for code, e in data.items()}
+            return {code: _migrate_entry(code, e) for code, e in data.items()}
         except FileNotFoundError:
             continue
         except (json.JSONDecodeError, OSError, AttributeError) as e:

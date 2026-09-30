@@ -16,8 +16,6 @@
         .code-table tbody tr.expired { color: #8b949e; text-decoration: line-through; }
         .copy-button { background-color: #238636; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; min-width: 80px; }
         .copy-button:hover { background-color: #2ea043; }
-        .redeem-button { background-color: #6e40c9; color: #fff; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
-        .redeem-button:hover { background-color: #8957e5; }
         .header-text { background-clip: text; -webkit-background-clip: text; color: transparent; background-image: linear-gradient(to right, #63a4ff, #8338ec); }
         input[type="checkbox"] { appearance: none; width: 18px; height: 18px; border: 2px solid #58a6ff; border-radius: 4px; cursor: pointer; position: relative; }
         input[type="checkbox"]:checked { background-color: #58a6ff; }
@@ -54,7 +52,7 @@
         <table class="code-table rounded-lg overflow-hidden">
             <thead>
                 <tr>
-                    <th class="rounded-tl-lg">Code</th><th>Source</th><th>Posted</th><th>Expires</th><th class="text-center">Activated</th><th class="rounded-tr-lg text-center">Expired</th>
+                    <th class="rounded-tl-lg">Code</th><th>Posted</th><th class="text-center">Activated</th><th class="rounded-tr-lg text-center">Expired</th>
                 </tr>
             </thead>
             <tbody id="code-list">
@@ -117,7 +115,6 @@
         }
 
         let lastData = null;
-        const REDEEM_URL = 'https://shift.gearboxsoftware.com/rewards';
 
         function showExpired() { return $('show-expired').checked; }
 
@@ -131,7 +128,7 @@
             const visible = showExpired() ? data.codes : data.codes.filter(c => !c.expired);
             $('counts').textContent = `${data.codes.length - expiredCount} active, ${expiredCount} expired` + (showExpired() ? '' : ' (hidden)');
             if (!visible.length) {
-                tbody.append(el('tr', {}, el('td', {colSpan: 6, className: 'text-center py-4 text-[#8b949e]', textContent: data.codes.length ? 'No active codes.' : 'No codes found.'})));
+                tbody.append(el('tr', {}, el('td', {colSpan: 4, className: 'text-center py-4 text-[#8b949e]', textContent: data.codes.length ? 'No active codes.' : 'No codes found.'})));
                 return;
             }
             visible.forEach(c => {
@@ -139,21 +136,10 @@
 
                 const copyBtn = el('button', {className: 'copy-button float-right', textContent: 'Copy'});
                 copyBtn.addEventListener('click', () => copyToClipboard(c.code, copyBtn));
-                // window.open must run synchronously inside the click or popup blockers stop it
-                const redeemBtn = el('button', {className: 'redeem-button float-right', textContent: 'Redeem', title: 'Copy code and open the SHiFT redeem page'});
-                redeemBtn.addEventListener('click', () => { window.open(REDEEM_URL, '_blank', 'noopener'); copyToClipboard(c.code, redeemBtn); });
-                row.append(el('td', {className: 'font-mono'}, el('span', {className: 'mr-4', textContent: c.code}), copyBtn, redeemBtn));
-
-                const source = el('td');
-                if (c.source_url && c.source_url.startsWith('https://')) {
-                    source.append(el('a', {href: c.source_url, target: '_blank', rel: 'noopener', textContent: c.source}));
-                } else {
-                    source.textContent = c.source;
-                }
-                row.append(source);
+                row.append(el('td', {className: 'font-mono'}, el('span', {className: 'mr-4', textContent: c.code}), copyBtn));
 
                 const posted = c.posted_at ? new Date(c.posted_at).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : c.found;
-                row.append(el('td', {textContent: posted}), el('td', {textContent: c.expires || 'N/A'}));
+                row.append(el('td', {textContent: posted}));
                 row.append(checkbox(c.code, 'activated', c.activated), checkbox(c.code, 'expired', c.expired_manually));
                 tbody.append(row);
             });

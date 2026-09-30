@@ -8,7 +8,6 @@ A Python bot and web dashboard that tracks **Borderlands 4** SHiFT codes. It wat
 - **Smart filtering**: understands posts like `BL4`, `MULTI` (all games) and lists such as `BL3: ... / BL4: ...`, and only keeps codes valid for Borderlands 4.
 - **Expiry detection**: parses `Expires 9/29`, `valid until Oct 5, 2026`, `expires 1st October`, ... Expired codes are greyed out automatically and left out of the Steam exports.
 - **Hide expired**: a "Show expired" toggle (remembered in your browser) keeps the list to codes that still work.
-- **One-click redeem**: the *Redeem* button copies the code and opens the SHiFT redeem page.
 - **Outage alerts**: if Reddit checks fail 3 times in a row you get one Discord message, and another when it recovers.
 - **Newest first**: codes are sorted by the time they were posted.
 - **Discord notifications** via webhook for codes posted in the last 3 days (so the initial import doesn't flood your channel).

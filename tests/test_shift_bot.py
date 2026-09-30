@@ -238,6 +238,23 @@ class StorageTests(StateTestCase):
         self.assertTrue(state[A]["found_at"].startswith("2025-09-1"))
         self.assertTrue(state[A]["activated"])
 
+    def test_very_old_entries_missing_fields_do_not_break_the_api(self):
+        # Shape found in a real old state file: no code/activated/source fields at all
+        with open(sb.STORAGE_FILE, "w") as f:
+            json.dump({A: {"expires": "", "source_url": "https://www.reddit.com/r/x/", "found_at": "2025-12-14T09:07:00+00:00"},
+                       B: {"expires": "Oct 05, 2026"},
+                       C: "garbage"}, f)
+        client = sb.app.test_client()
+        data = client.get("/api/codes").get_json()
+        self.assertEqual({c["code"] for c in data["codes"]}, {A, B, C})
+        first = next(c for c in data["codes"] if c["code"] == A)
+        self.assertFalse(first["activated"] or first["expired"])
+        self.assertEqual(first["source"], "Reddit")
+        self.assertEqual(next(c for c in data["codes"] if c["code"] == B)["expires"], "Oct 05, 2026")
+        self.assertEqual(client.get("/api/steam-json").status_code, 200)
+        self.assertEqual(client.get("/api/steam-bbcode").status_code, 200)
+        self.assertEqual(client.post("/api/codes", json={"code": A, "state": "activated", "value": True}).status_code, 200)
+
     def test_new_file_wins_over_legacy(self):
         legacy = os.path.join(self.tmp, "legacy.json")
         with open(legacy, "w") as f:
